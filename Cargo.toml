@@ -12,18 +12,12 @@ readme = "README.md"
 keywords = []
 exclude = [".gitignore", ".github/*"]
 
-
 [features]
-default = ["cargo"]
-cargo = []
-
-[[bin]]
-name = "thigpen"
+default = []
 
 [[bin]]
 name = "cargo-thigpen"
 path = "src/bin/cargo_thigpen.rs"
-required-features = ["cargo"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
