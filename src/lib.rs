@@ -1,7 +1,49 @@
-use std::fmt::Write;
+use std::io::Write as ioWrite;
 use std::path::Path;
+use std::{fmt::Write, io::Read};
 
-#[derive(Debug)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Cache {
+    pub name: String,
+    pub root: Lib,
+}
+
+impl Cache {
+    pub fn write(&self) -> Result<(), std::io::Error> {
+        let mut crate_root = self.root.path.clone().into_path_buf();
+        // XXX: rockstar (13 Jan 2023) - This is...not right. We need something more
+        // permanent than just guessing about all of this.
+        crate_root.pop();
+        crate_root.pop();
+        crate_root.push(".thigpen.cache");
+
+        let mut cache = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(crate_root)?;
+        cache.write_all(serde_json::to_string(self).unwrap().as_bytes())?;
+        Ok(())
+    }
+
+    pub fn read(crate_root: std::path::PathBuf) -> Result<Self, std::io::Error> {
+        let mut crate_root = crate_root;
+        // XXX: rockstar (13 Jan 2023) - This is...not right. We need something more
+        // permanent than just guessing about all of this.
+        crate_root.pop();
+        crate_root.push(".thigpen.cache");
+
+        let mut contents = String::new();
+        let mut file = std::fs::File::open(crate_root)?;
+        file.read_to_string(&mut contents).unwrap();
+        let cache = serde_json::from_str(&contents).unwrap();
+        Ok(cache)
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 enum PublicIdentifierType {
     Use,
     Const,
@@ -36,7 +78,7 @@ impl std::fmt::Display for PublicIdentifierType {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize)]
 struct PublicIdentifier {
     r#type: PublicIdentifierType,
     name: String,
@@ -187,7 +229,7 @@ impl PublicIdentifier {
 }
 
 /// A root crate
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize)]
 #[allow(dead_code)]
 pub struct Lib {
     name: String,
@@ -273,7 +315,7 @@ erDiagram
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Serialize)]
 #[allow(dead_code)]
 struct Module {
     name: String,
