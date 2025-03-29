@@ -89,7 +89,6 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
-    match args.command {
-        SubCommand::Thigpen(args) => args.command.run(),
-    }
+    let SubCommand::Thigpen(args) = args.command;
+    args.command.run();
 }
