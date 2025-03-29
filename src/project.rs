@@ -11,6 +11,10 @@ pub struct Project {
 }
 
 impl Project {
+    /// Load a project from a path
+    ///
+    /// The path will look for a `Cargo.toml` file in the current directory
+    /// or any parent directory, recursively.
     pub fn from_path(path: &std::path::Path) -> Result<Self, String> {
         let cargo_toml_path = {
             assert!(path.is_dir(), "Path is {}", path.to_str().unwrap());
@@ -66,6 +70,10 @@ impl Project {
         }
     }
 
+    /// Load a project from the cache
+    ///
+    /// The path will look for the cache file in the current directory
+    /// or any parent directory, recursively.
     pub fn from_cache(path: &std::path::Path) -> Result<Self, String> {
         let path = path.to_path_buf();
         let cache_path = {
@@ -94,6 +102,7 @@ impl Project {
         Ok(cache)
     }
 
+    /// Create a cache file
     pub fn cache(&self) -> Result<(), std::io::Error> {
         let mut cache_path: std::path::PathBuf = self.path.clone().into_path_buf();
         cache_path.push(".thigpen.cache");
@@ -107,6 +116,7 @@ impl Project {
         Ok(())
     }
 
+    /// Return the name of the crate
     pub fn name(&self) -> String {
         match &self.manifest.package {
             Some(package) => package.name.clone(),
@@ -116,7 +126,7 @@ impl Project {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub enum PublicIdentifierType {
+enum PublicIdentifierType {
     Use,
     Const,
     Enum,
@@ -151,7 +161,7 @@ impl std::fmt::Display for PublicIdentifierType {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub struct PublicIdentifier {
+struct PublicIdentifier {
     r#type: PublicIdentifierType,
     name: String,
 }
@@ -302,7 +312,7 @@ impl PublicIdentifier {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[allow(dead_code)]
-pub struct Module {
+struct Module {
     name: String,
     usepath: String,
     // TODO: not public please
@@ -313,7 +323,7 @@ pub struct Module {
 
 impl Module {
     #[allow(dead_code)]
-    pub fn from_file_path(name: &str, path: &Path) -> Self {
+    fn from_file_path(name: &str, path: &Path) -> Self {
         assert_eq!(path.file_name(), Some(std::ffi::OsStr::new("lib.rs")));
 
         let contents = std::fs::read_to_string(path)
