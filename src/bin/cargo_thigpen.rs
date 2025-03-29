@@ -29,6 +29,7 @@ enum ThigpenSubcommand {
     Scan,
     #[clap(visible_alias("vis"))]
     Visualize(VisualizeArgs),
+    Clean,
 }
 
 impl ThigpenSubcommand {
@@ -58,6 +59,28 @@ impl ThigpenSubcommand {
                     }
                 };
                 unimplemented!("visualizations are not implemented (yet)");
+            }
+            ThigpenSubcommand::Clean => {
+                let path = path.to_path_buf();
+                let cache_path = {
+                    assert!(path.is_dir(), "Path is {}", path.to_str().unwrap());
+        
+                    let mut path = path.to_path_buf();
+                    loop {
+                        path.push(".thigpen.cache");
+                        if path.is_file() {
+                            break;
+                        }
+                        if !(path.pop() && path.pop()) {
+                            eprintln!(
+                                "Could not find thigpen cache file in any parent of the current working directory"
+                            );
+                            std::process::exit(1);
+                        }
+                    }
+                    path
+                };
+                std::fs::remove_file(cache_path).unwrap();
             }
         }
     }
