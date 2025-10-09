@@ -14,16 +14,24 @@ pub trait Visualization {
 
 pub struct DotVisualization {
     project: Project,
-    relations: RefCell<Vec<(String, String)>>,
+    children: RefCell<Vec<(String, String)>>,
+    dependencies: RefCell<Vec<(String, String)>>,
 }
 
 impl Visitor for DotVisualization {
     fn visit(&self, module: &Module) {
         for child in &module.children {
-            self.relations
+            self.children
                 .borrow_mut()
                 .push((module.usepath.clone(), child.usepath.clone()));
             self.visit(child);
+        }
+
+        // Add dependency relations (this module -> modules it depends on)
+        for dependency in &module.dependencies {
+            self.dependencies
+                .borrow_mut()
+                .push((module.usepath.clone(), dependency.target_module.clone()));
         }
     }
 }
@@ -32,7 +40,8 @@ impl Visualization for DotVisualization {
     fn new(project: Project) -> Self {
         Self {
             project,
-            relations: RefCell::new(vec![]),
+            children: RefCell::new(vec![]),
+            dependencies: RefCell::new(vec![]),
         }
     }
 
@@ -40,9 +49,34 @@ impl Visualization for DotVisualization {
         self.visit(&self.project.module);
 
         writeln!(writer, "graph relations {{").unwrap();
-        for relation in self.relations.borrow().iter() {
-            writeln!(writer, "\"{}\" -- \"{}\"", relation.0, relation.1).unwrap();
+        writeln!(writer, "  // Node styling").unwrap();
+        writeln!(writer, "  node [shape=box, style=rounded];").unwrap();
+        writeln!(writer).unwrap();
+
+        // Draw hierarchy relations (solid black lines)
+        writeln!(writer, "  // Module hierarchy").unwrap();
+        for (from, to) in self.children.borrow().iter() {
+            writeln!(
+                writer,
+                "  \"{}\" -- \"{}\" [color=black, style=solid];",
+                from, to
+            )
+            .unwrap();
         }
+
+        writeln!(writer).unwrap();
+
+        // Draw dependency relations (dashed red lines)
+        writeln!(writer, "  // Dependencies").unwrap();
+        for (from, to) in self.dependencies.borrow().iter() {
+            writeln!(
+                writer,
+                "  \"{}\" -- \"{}\" [color=red, style=dashed];",
+                from, to
+            )
+            .unwrap();
+        }
+
         writeln!(writer, "}}").unwrap();
     }
 }

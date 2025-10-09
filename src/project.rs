@@ -166,6 +166,14 @@ pub struct PublicIdentifier {
     pub name: String,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ModuleDependency {
+    /// The module path that this module depends on (e.g., "crate::foo::bar")
+    pub target_module: String,
+    /// The symbols imported from that module
+    pub imported_symbols: Vec<String>,
+}
+
 impl PublicIdentifier {
     fn from_use(value: &syn::UseTree) -> Vec<Self> {
         match value {
@@ -187,6 +195,128 @@ impl PublicIdentifier {
                 .iter()
                 .flat_map(PublicIdentifier::from_use)
                 .collect(),
+        }
+    }
+
+    /// Extract the full path from a use tree (e.g., "crate::foo::bar")
+    fn extract_use_paths(value: &syn::UseTree) -> Vec<String> {
+        fn extract_path_recursive(tree: &syn::UseTree, current_path: String) -> Vec<String> {
+            match tree {
+                syn::UseTree::Path(usepath) => {
+                    let segment = usepath.ident.to_string();
+                    let new_path = if current_path.is_empty() {
+                        segment
+                    } else {
+                        format!("{}::{}", current_path, segment)
+                    };
+                    extract_path_recursive(&usepath.tree, new_path)
+                }
+                syn::UseTree::Name(name) => {
+                    let segment = name.ident.to_string();
+                    let full_path = if current_path.is_empty() {
+                        segment
+                    } else {
+                        format!("{}::{}", current_path, segment)
+                    };
+                    vec![full_path]
+                }
+                syn::UseTree::Rename(rename) => {
+                    let segment = rename.ident.to_string();
+                    let full_path = if current_path.is_empty() {
+                        segment
+                    } else {
+                        format!("{}::{}", current_path, segment)
+                    };
+                    vec![full_path]
+                }
+                syn::UseTree::Glob(_) => {
+                    // For glob imports, return the path to the module
+                    vec![current_path]
+                }
+                syn::UseTree::Group(group) => group
+                    .items
+                    .iter()
+                    .flat_map(|item| extract_path_recursive(item, current_path.clone()))
+                    .collect(),
+            }
+        }
+        extract_path_recursive(value, String::new())
+    }
+
+    /// Extract internal crate dependencies from syn items
+    fn extract_dependencies_from_items(
+        items: &[syn::Item],
+        current_module_path: &str,
+    ) -> Vec<ModuleDependency> {
+        let mut dependencies = std::collections::HashMap::new();
+
+        for item in items {
+            if let syn::Item::Use(use_item) = item {
+                let paths = PublicIdentifier::extract_use_paths(&use_item.tree);
+
+                for path in paths {
+                    // Only consider internal crate references
+                    if path.starts_with("crate::")
+                        || path.starts_with("super::")
+                        || path.starts_with("self::")
+                    {
+                        let normalized_path =
+                            PublicIdentifier::normalize_use_path(&path, current_module_path);
+
+                        if let Some((module_path, symbol)) =
+                            PublicIdentifier::split_module_and_symbol(&normalized_path)
+                        {
+                            dependencies
+                                .entry(module_path)
+                                .or_insert_with(Vec::new)
+                                .push(symbol);
+                        }
+                    }
+                }
+            }
+        }
+
+        dependencies
+            .into_iter()
+            .map(|(target_module, imported_symbols)| ModuleDependency {
+                target_module,
+                imported_symbols,
+            })
+            .collect()
+    }
+
+    /// Normalize relative paths (super::, self::) to absolute crate paths
+    fn normalize_use_path(path: &str, current_module_path: &str) -> String {
+        if path.starts_with("crate::") {
+            path.to_string()
+        } else if path.starts_with("super::") {
+            // Navigate up one level from current module
+            let parts: Vec<&str> = current_module_path.split("::").collect();
+            if parts.len() > 1 {
+                let parent_path = parts[..parts.len() - 1].join("::");
+                path.replacen("super::", &format!("{}::", parent_path), 1)
+            } else {
+                // super:: from root goes to crate::
+                path.replacen("super::", "crate::", 1)
+            }
+        } else if path.starts_with("self::") {
+            path.replacen("self::", &format!("{}::", current_module_path), 1)
+        } else {
+            // Relative path, assume it's within current module
+            format!("{}::{}", current_module_path, path)
+        }
+    }
+
+    /// Split a full path into module path and symbol name
+    /// e.g., "crate::foo::bar::Symbol" -> Some(("crate::foo::bar", "Symbol"))
+    fn split_module_and_symbol(path: &str) -> Option<(String, String)> {
+        let parts: Vec<&str> = path.split("::").collect();
+        if parts.len() >= 2 {
+            let symbol = parts.last().unwrap().to_string();
+            let module_path = parts[..parts.len() - 1].join("::");
+            Some((module_path, symbol))
+        } else {
+            None
         }
     }
 
@@ -319,6 +449,7 @@ pub struct Module {
     pub path: Option<Box<std::path::Path>>,
     pub interface: Vec<PublicIdentifier>,
     pub children: Vec<Module>,
+    pub dependencies: Vec<ModuleDependency>,
 }
 
 impl Module {
@@ -345,6 +476,8 @@ impl Module {
             .collect();
 
         let interface: Vec<PublicIdentifier> = PublicIdentifier::find_in_items(&parsed_file.items);
+        let dependencies =
+            PublicIdentifier::extract_dependencies_from_items(&parsed_file.items, name);
 
         Self {
             name: name.into(),
@@ -352,6 +485,7 @@ impl Module {
             path: Some(path.into()),
             interface,
             children,
+            dependencies,
         }
     }
 
@@ -390,10 +524,15 @@ impl Module {
                 path: None,
                 interface: vec![],
                 children: vec![],
+                dependencies: vec![],
             };
         }
 
-        let (children, interface): (Vec<Module>, Vec<PublicIdentifier>) = paths
+        let (children, interface, dependencies): (
+            Vec<Module>,
+            Vec<PublicIdentifier>,
+            Vec<ModuleDependency>,
+        ) = paths
             .iter()
             .map(|modpath| {
                 log::debug!("Reading/parsing {:?}", path);
@@ -425,12 +564,15 @@ impl Module {
 
                 let interface: Vec<PublicIdentifier> =
                     PublicIdentifier::find_in_items(&parsed_file.items);
+                let dependencies =
+                    PublicIdentifier::extract_dependencies_from_items(&parsed_file.items, usepath);
 
-                (modules, interface)
+                (modules, interface, dependencies)
             })
-            .fold((vec![], vec![]), |mut acc, x| {
+            .fold((vec![], vec![], vec![]), |mut acc, x| {
                 acc.0.extend(x.0);
                 acc.1.extend(x.1);
+                acc.2.extend(x.2);
                 acc
             });
 
@@ -440,6 +582,7 @@ impl Module {
             path: Some(path.into()),
             interface,
             children,
+            dependencies,
         }
     }
 }
