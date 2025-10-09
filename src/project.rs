@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 pub struct Project {
     manifest: cargo_toml::Manifest,
     path: Box<Path>,
-    module: Module,
+    pub module: Module,
 }
 
 impl Project {
@@ -126,7 +126,7 @@ impl Project {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-enum PublicIdentifierType {
+pub enum PublicIdentifierType {
     Use,
     Const,
     Enum,
@@ -161,9 +161,9 @@ impl std::fmt::Display for PublicIdentifierType {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct PublicIdentifier {
+pub struct PublicIdentifier {
     r#type: PublicIdentifierType,
-    name: String,
+    pub name: String,
 }
 
 impl PublicIdentifier {
@@ -312,17 +312,16 @@ impl PublicIdentifier {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[allow(dead_code)]
-struct Module {
-    name: String,
-    usepath: String,
+pub struct Module {
+    pub name: String,
+    pub usepath: String,
     // TODO: not public please
     pub path: Option<Box<std::path::Path>>,
-    interface: Vec<PublicIdentifier>,
-    children: Vec<Module>,
+    pub interface: Vec<PublicIdentifier>,
+    pub children: Vec<Module>,
 }
 
 impl Module {
-    #[allow(dead_code)]
     fn from_file_path(name: &str, path: &Path) -> Self {
         assert_eq!(path.file_name(), Some(std::ffi::OsStr::new("lib.rs")));
 
@@ -335,7 +334,7 @@ impl Module {
             .iter()
             .filter_map(|item| match item {
                 syn::Item::Mod(inner) => {
-                    let module = Module::from_path(
+                    let module = Module::from_usepath(
                         &format!("{}::{}", name, inner.ident),
                         path.parent().unwrap(),
                     );
@@ -356,7 +355,7 @@ impl Module {
         }
     }
 
-    fn from_path(usepath: &str, path: &Path) -> Self {
+    fn from_usepath(usepath: &str, path: &Path) -> Self {
         assert_ne!(path.file_name(), Some(std::ffi::OsStr::new("lib.rs")));
         assert_ne!(path.extension(), Some(std::ffi::OsStr::new("rs")));
         assert!(path.exists(), "Path at {:?} does not exist", path);
@@ -411,7 +410,7 @@ impl Module {
                             let mut path = path.to_path_buf();
                             path.push(name);
                             if path.exists() {
-                                Some(Module::from_path(
+                                Some(Module::from_usepath(
                                     &format!("{}::{}", usepath, inner.ident),
                                     &path,
                                 ))

@@ -1,27 +1,35 @@
 use clap::{Parser, Subcommand, ValueEnum};
 
-use thigpen::Project;
+use thigpen::{DotVisualization, Project, Visualization};
 
 #[derive(Clone, Debug, Default, ValueEnum)]
 enum OutputType {
     #[default]
-    Mermaid,
+    Dot,
 }
 
 impl std::fmt::Display for OutputType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Mermaid => write!(f, "mermaid"),
+            Self::Dot => write!(f, "dot"),
+        }
+    }
+}
+
+impl OutputType {
+    pub fn new_visualization(&self, project: Project) -> impl Visualization {
+        match self {
+            Self::Dot => DotVisualization::new(project),
         }
     }
 }
 
 #[derive(Debug, Parser)]
 struct VisualizeArgs {
-    #[arg(long, default_value_t = OutputType::Mermaid)]
+    #[arg(long, default_value_t = OutputType::Dot, hide(true))]
     output_type: OutputType,
-    #[arg(short)]
-    output: Option<String>,
+    #[arg(short, help = "the file to output data to")]
+    output: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -50,21 +58,29 @@ impl ThigpenSubcommand {
                     std::process::exit(1);
                 }
             }
-            ThigpenSubcommand::Visualize(_) => {
-                let _project = match Project::from_cache(&path) {
+            ThigpenSubcommand::Visualize(args) => {
+                let project = match Project::from_cache(&path) {
                     Ok(project) => project,
                     Err(err) => {
                         eprintln!("Unable to read project scan cache. {}", err);
                         std::process::exit(1);
                     }
                 };
-                unimplemented!("visualizations are not implemented (yet)");
+                let visualization = args.output_type.new_visualization(project);
+
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&args.output)
+                    .unwrap();
+                visualization.visualize(&mut file);
             }
             ThigpenSubcommand::Clean => {
                 let path = path.to_path_buf();
                 let cache_path = {
                     assert!(path.is_dir(), "Path is {}", path.to_str().unwrap());
-        
+
                     let mut path = path.to_path_buf();
                     loop {
                         path.push(".thigpen.cache");
@@ -73,7 +89,7 @@ impl ThigpenSubcommand {
                         }
                         if !(path.pop() && path.pop()) {
                             eprintln!(
-                                "Could not find thigpen cache file in any parent of the current working directory"
+                                "Could not find thigpen cache file in any parent of the current working directory. Please run `cargo thigpen scan` first."
                             );
                             std::process::exit(1);
                         }
