@@ -97,6 +97,9 @@ impl Project {
 
         let mut contents = String::new();
         let mut file = std::fs::File::open(cache_path).unwrap();
+        // XXX: rockstar (13 Oct 2025) - There's a serialization error here
+        // where the cache is too old for current struct definition, so the
+        // cache needs to be regenerated.
         file.read_to_string(&mut contents).unwrap();
         let cache = serde_json::from_str(&contents).unwrap();
         Ok(cache)
@@ -170,8 +173,10 @@ pub struct PublicIdentifier {
 pub struct ModuleDependency {
     /// The module path that this module depends on (e.g., "crate::foo::bar")
     pub target_module: String,
-    /// The symbols imported from that module
+    /// The symbols imported from that module via `use` statements
     pub imported_symbols: Vec<String>,
+    /// The symbols referenced directly from that module (e.g., crate::foo::Symbol::new())
+    pub referenced_symbols: Vec<String>,
 }
 
 impl PublicIdentifier {
@@ -250,6 +255,7 @@ impl PublicIdentifier {
     ) -> Vec<ModuleDependency> {
         let mut dependencies = std::collections::HashMap::new();
 
+        // First pass: extract use statements
         for item in items {
             if let syn::Item::Use(use_item) = item {
                 let paths = PublicIdentifier::extract_use_paths(&use_item.tree);
@@ -268,7 +274,8 @@ impl PublicIdentifier {
                         {
                             dependencies
                                 .entry(module_path)
-                                .or_insert_with(Vec::new)
+                                .or_insert_with(|| (Vec::new(), Vec::new()))
+                                .0
                                 .push(symbol);
                         }
                     }
@@ -276,12 +283,28 @@ impl PublicIdentifier {
             }
         }
 
+        // Second pass: extract direct references
+        for item in items {
+            let direct_refs =
+                PublicIdentifier::extract_direct_references(item, current_module_path);
+            for (module_path, symbol) in direct_refs {
+                dependencies
+                    .entry(module_path)
+                    .or_insert_with(|| (Vec::new(), Vec::new()))
+                    .1
+                    .push(symbol);
+            }
+        }
+
         dependencies
             .into_iter()
-            .map(|(target_module, imported_symbols)| ModuleDependency {
-                target_module,
-                imported_symbols,
-            })
+            .map(
+                |(target_module, (imported_symbols, referenced_symbols))| ModuleDependency {
+                    target_module,
+                    imported_symbols,
+                    referenced_symbols,
+                },
+            )
             .collect()
     }
 
@@ -309,15 +332,226 @@ impl PublicIdentifier {
 
     /// Split a full path into module path and symbol name
     /// e.g., "crate::foo::bar::Symbol" -> Some(("crate::foo::bar", "Symbol"))
+    /// For method calls like "crate::foo::Type::method", we want ("crate::foo", "Type")
     fn split_module_and_symbol(path: &str) -> Option<(String, String)> {
         let parts: Vec<&str> = path.split("::").collect();
         if parts.len() >= 2 {
-            let symbol = parts.last().unwrap().to_string();
-            let module_path = parts[..parts.len() - 1].join("::");
-            Some((module_path, symbol))
+            // For paths with multiple segments, we assume the last segment that starts
+            // with a capital letter is the type, and everything after that is a method/field
+            let mut type_index = parts.len() - 1;
+
+            // Look for the last segment that starts with a capital letter (likely a type)
+            for (i, part) in parts.iter().enumerate().rev() {
+                if part
+                    .chars()
+                    .next()
+                    .map(|c| c.is_uppercase())
+                    .unwrap_or(false)
+                {
+                    type_index = i;
+                    break;
+                }
+            }
+
+            if type_index > 0 {
+                let symbol = parts[type_index].to_string();
+                let module_path = parts[..type_index].join("::");
+                Some((module_path, symbol))
+            } else {
+                // Fallback to the old logic if we can't find a proper type
+                let symbol = parts.last().unwrap().to_string();
+                let module_path = parts[..parts.len() - 1].join("::");
+                Some((module_path, symbol))
+            }
         } else {
             None
         }
+    }
+
+    /// Extract direct references to internal crate symbols from an item
+    /// This analyzes the entire AST of the item to find path expressions
+    fn extract_direct_references(
+        item: &syn::Item,
+        current_module_path: &str,
+    ) -> Vec<(String, String)> {
+        let mut references = Vec::new();
+
+        match item {
+            syn::Item::Fn(item_fn) => {
+                // Analyze function signature
+                PublicIdentifier::visit_fn_sig(&item_fn.sig, current_module_path, &mut references);
+
+                // Analyze function body
+                PublicIdentifier::visit_block(&item_fn.block, current_module_path, &mut references);
+            }
+            syn::Item::Struct(item_struct) => {
+                // Analyze struct fields
+                match &item_struct.fields {
+                    syn::Fields::Named(fields) => {
+                        for field in &fields.named {
+                            PublicIdentifier::visit_type(
+                                &field.ty,
+                                current_module_path,
+                                &mut references,
+                            );
+                        }
+                    }
+                    syn::Fields::Unnamed(fields) => {
+                        for field in &fields.unnamed {
+                            PublicIdentifier::visit_type(
+                                &field.ty,
+                                current_module_path,
+                                &mut references,
+                            );
+                        }
+                    }
+                    syn::Fields::Unit => {}
+                }
+            }
+            syn::Item::Enum(item_enum) => {
+                // Analyze enum variants
+                for variant in &item_enum.variants {
+                    match &variant.fields {
+                        syn::Fields::Named(fields) => {
+                            for field in &fields.named {
+                                PublicIdentifier::visit_type(
+                                    &field.ty,
+                                    current_module_path,
+                                    &mut references,
+                                );
+                            }
+                        }
+                        syn::Fields::Unnamed(fields) => {
+                            for field in &fields.unnamed {
+                                PublicIdentifier::visit_type(
+                                    &field.ty,
+                                    current_module_path,
+                                    &mut references,
+                                );
+                            }
+                        }
+                        syn::Fields::Unit => {}
+                    }
+                }
+            }
+            syn::Item::Trait(item_trait) => {
+                // Analyze trait items
+                for trait_item in &item_trait.items {
+                    match trait_item {
+                        syn::TraitItem::Fn(trait_fn) => {
+                            PublicIdentifier::visit_fn_sig(
+                                &trait_fn.sig,
+                                current_module_path,
+                                &mut references,
+                            );
+                            if let Some(block) = &trait_fn.default {
+                                PublicIdentifier::visit_block(
+                                    block,
+                                    current_module_path,
+                                    &mut references,
+                                );
+                            }
+                        }
+                        syn::TraitItem::Type(trait_type) => {
+                            if let Some(default) = &trait_type.default {
+                                PublicIdentifier::visit_type(
+                                    &default.1,
+                                    current_module_path,
+                                    &mut references,
+                                );
+                            }
+                        }
+                        syn::TraitItem::Const(trait_const) => {
+                            PublicIdentifier::visit_type(
+                                &trait_const.ty,
+                                current_module_path,
+                                &mut references,
+                            );
+                            if let Some(default) = &trait_const.default {
+                                PublicIdentifier::visit_expr(
+                                    &default.1,
+                                    current_module_path,
+                                    &mut references,
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            syn::Item::Impl(item_impl) => {
+                // Analyze impl block
+                PublicIdentifier::visit_type(
+                    &item_impl.self_ty,
+                    current_module_path,
+                    &mut references,
+                );
+                if let Some((_, trait_path, _)) = &item_impl.trait_ {
+                    PublicIdentifier::visit_path(trait_path, current_module_path, &mut references);
+                }
+
+                for impl_item in &item_impl.items {
+                    match impl_item {
+                        syn::ImplItem::Fn(impl_fn) => {
+                            PublicIdentifier::visit_fn_sig(
+                                &impl_fn.sig,
+                                current_module_path,
+                                &mut references,
+                            );
+                            PublicIdentifier::visit_block(
+                                &impl_fn.block,
+                                current_module_path,
+                                &mut references,
+                            );
+                        }
+                        syn::ImplItem::Type(impl_type) => {
+                            PublicIdentifier::visit_type(
+                                &impl_type.ty,
+                                current_module_path,
+                                &mut references,
+                            );
+                        }
+                        syn::ImplItem::Const(impl_const) => {
+                            PublicIdentifier::visit_type(
+                                &impl_const.ty,
+                                current_module_path,
+                                &mut references,
+                            );
+                            PublicIdentifier::visit_expr(
+                                &impl_const.expr,
+                                current_module_path,
+                                &mut references,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            syn::Item::Type(item_type) => {
+                PublicIdentifier::visit_type(&item_type.ty, current_module_path, &mut references);
+            }
+            syn::Item::Const(item_const) => {
+                PublicIdentifier::visit_type(&item_const.ty, current_module_path, &mut references);
+                PublicIdentifier::visit_expr(
+                    &item_const.expr,
+                    current_module_path,
+                    &mut references,
+                );
+            }
+            syn::Item::Static(item_static) => {
+                PublicIdentifier::visit_type(&item_static.ty, current_module_path, &mut references);
+                PublicIdentifier::visit_expr(
+                    &item_static.expr,
+                    current_module_path,
+                    &mut references,
+                );
+            }
+            _ => {
+                // For other items (mods, uses, etc.), we don't need to analyze references
+            }
+        }
+
+        references
     }
 
     fn find_in_items(items: &[syn::Item]) -> Vec<Self> {
@@ -437,6 +671,426 @@ impl PublicIdentifier {
             })
             .flatten()
             .collect()
+    }
+
+    /// Visit a function signature to find type references
+    fn visit_fn_sig(
+        sig: &syn::Signature,
+        current_module_path: &str,
+        references: &mut Vec<(String, String)>,
+    ) {
+        // Visit input types
+        for input in &sig.inputs {
+            match input {
+                syn::FnArg::Typed(pat_type) => {
+                    PublicIdentifier::visit_type(&pat_type.ty, current_module_path, references);
+                }
+                syn::FnArg::Receiver(receiver) => {
+                    // For self parameters, check if there's a type annotation
+                    if let syn::Type::Reference(type_ref) = &*receiver.ty {
+                        PublicIdentifier::visit_type(
+                            &type_ref.elem,
+                            current_module_path,
+                            references,
+                        );
+                    } else {
+                        PublicIdentifier::visit_type(&receiver.ty, current_module_path, references);
+                    }
+                }
+            }
+        }
+
+        // Visit return type
+        match &sig.output {
+            syn::ReturnType::Type(_, ty) => {
+                PublicIdentifier::visit_type(ty, current_module_path, references);
+            }
+            syn::ReturnType::Default => {}
+        }
+    }
+
+    /// Visit a type to find path references
+    fn visit_type(
+        ty: &syn::Type,
+        current_module_path: &str,
+        references: &mut Vec<(String, String)>,
+    ) {
+        match ty {
+            syn::Type::Path(type_path) => {
+                PublicIdentifier::visit_path(&type_path.path, current_module_path, references);
+            }
+            syn::Type::Reference(type_ref) => {
+                PublicIdentifier::visit_type(&type_ref.elem, current_module_path, references);
+            }
+            syn::Type::Ptr(type_ptr) => {
+                PublicIdentifier::visit_type(&type_ptr.elem, current_module_path, references);
+            }
+            syn::Type::Slice(type_slice) => {
+                PublicIdentifier::visit_type(&type_slice.elem, current_module_path, references);
+            }
+            syn::Type::Array(type_array) => {
+                PublicIdentifier::visit_type(&type_array.elem, current_module_path, references);
+                PublicIdentifier::visit_expr(&type_array.len, current_module_path, references);
+            }
+            syn::Type::Tuple(type_tuple) => {
+                for elem in &type_tuple.elems {
+                    PublicIdentifier::visit_type(elem, current_module_path, references);
+                }
+            }
+            syn::Type::Paren(type_paren) => {
+                PublicIdentifier::visit_type(&type_paren.elem, current_module_path, references);
+            }
+            syn::Type::Group(type_group) => {
+                PublicIdentifier::visit_type(&type_group.elem, current_module_path, references);
+            }
+            _ => {
+                // Other types don't contain paths we care about
+            }
+        }
+    }
+
+    /// Visit a path to extract internal crate references
+    fn visit_path(
+        path: &syn::Path,
+        current_module_path: &str,
+        references: &mut Vec<(String, String)>,
+    ) {
+        let path_str = path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect::<Vec<_>>()
+            .join("::");
+
+        // Skip simple identifiers that don't represent module paths
+        if !path_str.contains("::") {
+            return;
+        }
+
+        // Only consider internal crate references, but filter out pure "self" references
+        if (path_str.starts_with("crate")
+            || path_str.starts_with("super")
+            || path_str.starts_with("self::"))
+            && path_str != "self"
+        {
+            let normalized_path =
+                PublicIdentifier::normalize_use_path(&path_str, current_module_path);
+
+            // Don't create self-references
+            if let Some((module_path, symbol)) =
+                PublicIdentifier::split_module_and_symbol(&normalized_path)
+            {
+                let current_module_normalized = current_module_path.replace("thigpen::", "crate::");
+                if module_path != current_module_normalized && module_path != current_module_path {
+                    references.push((module_path, symbol));
+                }
+            }
+        }
+
+        // Also visit any type arguments in the path segments
+        for segment in &path.segments {
+            match &segment.arguments {
+                syn::PathArguments::AngleBracketed(args) => {
+                    for arg in &args.args {
+                        match arg {
+                            syn::GenericArgument::Type(ty) => {
+                                PublicIdentifier::visit_type(ty, current_module_path, references);
+                            }
+                            syn::GenericArgument::Const(expr) => {
+                                PublicIdentifier::visit_expr(expr, current_module_path, references);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                syn::PathArguments::Parenthesized(args) => {
+                    for input in &args.inputs {
+                        PublicIdentifier::visit_type(input, current_module_path, references);
+                    }
+                    if let syn::ReturnType::Type(_, ty) = &args.output {
+                        PublicIdentifier::visit_type(ty, current_module_path, references);
+                    }
+                }
+                syn::PathArguments::None => {}
+            }
+        }
+    }
+
+    /// Visit a block to find all references within
+    fn visit_block(
+        block: &syn::Block,
+        current_module_path: &str,
+        references: &mut Vec<(String, String)>,
+    ) {
+        for stmt in &block.stmts {
+            PublicIdentifier::visit_stmt(stmt, current_module_path, references);
+        }
+    }
+
+    /// Visit a statement
+    fn visit_stmt(
+        stmt: &syn::Stmt,
+        current_module_path: &str,
+        references: &mut Vec<(String, String)>,
+    ) {
+        match stmt {
+            syn::Stmt::Local(local) => {
+                if let Some(init) = &local.init {
+                    PublicIdentifier::visit_expr(&init.expr, current_module_path, references);
+                }
+                // Extract type from pattern if it's a typed pattern
+                PublicIdentifier::visit_pat(&local.pat, current_module_path, references);
+            }
+            syn::Stmt::Item(item) => {
+                let item_refs =
+                    PublicIdentifier::extract_direct_references(item, current_module_path);
+                references.extend(item_refs);
+            }
+            syn::Stmt::Expr(expr, _) => {
+                PublicIdentifier::visit_expr(expr, current_module_path, references);
+            }
+            syn::Stmt::Macro(stmt_macro) => {
+                // For macro calls, we could analyze the tokens, but that's complex
+                // For now, skip macro analysis
+                let _ = stmt_macro;
+            }
+        }
+    }
+
+    /// Visit an expression to find all path references
+    fn visit_expr(
+        expr: &syn::Expr,
+        current_module_path: &str,
+        references: &mut Vec<(String, String)>,
+    ) {
+        match expr {
+            syn::Expr::Path(expr_path) => {
+                PublicIdentifier::visit_path(&expr_path.path, current_module_path, references);
+            }
+            syn::Expr::Call(expr_call) => {
+                PublicIdentifier::visit_expr(&expr_call.func, current_module_path, references);
+                for arg in &expr_call.args {
+                    PublicIdentifier::visit_expr(arg, current_module_path, references);
+                }
+            }
+            syn::Expr::MethodCall(expr_method) => {
+                PublicIdentifier::visit_expr(
+                    &expr_method.receiver,
+                    current_module_path,
+                    references,
+                );
+                for arg in &expr_method.args {
+                    PublicIdentifier::visit_expr(arg, current_module_path, references);
+                }
+            }
+            syn::Expr::Field(expr_field) => {
+                PublicIdentifier::visit_expr(&expr_field.base, current_module_path, references);
+            }
+            syn::Expr::Index(expr_index) => {
+                PublicIdentifier::visit_expr(&expr_index.expr, current_module_path, references);
+                PublicIdentifier::visit_expr(&expr_index.index, current_module_path, references);
+            }
+            syn::Expr::Unary(expr_unary) => {
+                PublicIdentifier::visit_expr(&expr_unary.expr, current_module_path, references);
+            }
+            syn::Expr::Binary(expr_binary) => {
+                PublicIdentifier::visit_expr(&expr_binary.left, current_module_path, references);
+                PublicIdentifier::visit_expr(&expr_binary.right, current_module_path, references);
+            }
+            syn::Expr::Cast(expr_cast) => {
+                PublicIdentifier::visit_expr(&expr_cast.expr, current_module_path, references);
+                PublicIdentifier::visit_type(&expr_cast.ty, current_module_path, references);
+            }
+
+            syn::Expr::Let(expr_let) => {
+                PublicIdentifier::visit_expr(&expr_let.expr, current_module_path, references);
+            }
+            syn::Expr::If(expr_if) => {
+                PublicIdentifier::visit_expr(&expr_if.cond, current_module_path, references);
+                PublicIdentifier::visit_block(
+                    &expr_if.then_branch,
+                    current_module_path,
+                    references,
+                );
+                if let Some((_, else_branch)) = &expr_if.else_branch {
+                    PublicIdentifier::visit_expr(else_branch, current_module_path, references);
+                }
+            }
+            syn::Expr::While(expr_while) => {
+                PublicIdentifier::visit_expr(&expr_while.cond, current_module_path, references);
+                PublicIdentifier::visit_block(&expr_while.body, current_module_path, references);
+            }
+            syn::Expr::ForLoop(expr_for) => {
+                PublicIdentifier::visit_expr(&expr_for.expr, current_module_path, references);
+                PublicIdentifier::visit_block(&expr_for.body, current_module_path, references);
+            }
+            syn::Expr::Loop(expr_loop) => {
+                PublicIdentifier::visit_block(&expr_loop.body, current_module_path, references);
+            }
+            syn::Expr::Match(expr_match) => {
+                PublicIdentifier::visit_expr(&expr_match.expr, current_module_path, references);
+                for arm in &expr_match.arms {
+                    if let Some((_, guard)) = &arm.guard {
+                        PublicIdentifier::visit_expr(guard, current_module_path, references);
+                    }
+                    PublicIdentifier::visit_expr(&arm.body, current_module_path, references);
+                }
+            }
+            syn::Expr::Closure(expr_closure) => {
+                for input in &expr_closure.inputs {
+                    if let syn::Pat::Type(pat_type) = input {
+                        PublicIdentifier::visit_type(&pat_type.ty, current_module_path, references);
+                    }
+                }
+                PublicIdentifier::visit_expr(&expr_closure.body, current_module_path, references);
+            }
+            syn::Expr::Block(expr_block) => {
+                PublicIdentifier::visit_block(&expr_block.block, current_module_path, references);
+            }
+            syn::Expr::Assign(expr_assign) => {
+                PublicIdentifier::visit_expr(&expr_assign.left, current_module_path, references);
+                PublicIdentifier::visit_expr(&expr_assign.right, current_module_path, references);
+            }
+
+            syn::Expr::Return(expr_return) => {
+                if let Some(expr) = &expr_return.expr {
+                    PublicIdentifier::visit_expr(expr, current_module_path, references);
+                }
+            }
+            syn::Expr::Break(expr_break) => {
+                if let Some(expr) = &expr_break.expr {
+                    PublicIdentifier::visit_expr(expr, current_module_path, references);
+                }
+            }
+            syn::Expr::Continue(_) => {}
+            syn::Expr::Tuple(expr_tuple) => {
+                for elem in &expr_tuple.elems {
+                    PublicIdentifier::visit_expr(elem, current_module_path, references);
+                }
+            }
+            syn::Expr::Array(expr_array) => {
+                for elem in &expr_array.elems {
+                    PublicIdentifier::visit_expr(elem, current_module_path, references);
+                }
+            }
+            syn::Expr::Repeat(expr_repeat) => {
+                PublicIdentifier::visit_expr(&expr_repeat.expr, current_module_path, references);
+                PublicIdentifier::visit_expr(&expr_repeat.len, current_module_path, references);
+            }
+            syn::Expr::Paren(expr_paren) => {
+                PublicIdentifier::visit_expr(&expr_paren.expr, current_module_path, references);
+            }
+            syn::Expr::Group(expr_group) => {
+                PublicIdentifier::visit_expr(&expr_group.expr, current_module_path, references);
+            }
+            syn::Expr::Try(expr_try) => {
+                PublicIdentifier::visit_expr(&expr_try.expr, current_module_path, references);
+            }
+            syn::Expr::Async(expr_async) => {
+                PublicIdentifier::visit_block(&expr_async.block, current_module_path, references);
+            }
+            syn::Expr::Await(expr_await) => {
+                PublicIdentifier::visit_expr(&expr_await.base, current_module_path, references);
+            }
+            syn::Expr::TryBlock(expr_try_block) => {
+                PublicIdentifier::visit_block(
+                    &expr_try_block.block,
+                    current_module_path,
+                    references,
+                );
+            }
+            syn::Expr::Yield(expr_yield) => {
+                if let Some(expr) = &expr_yield.expr {
+                    PublicIdentifier::visit_expr(expr, current_module_path, references);
+                }
+            }
+            syn::Expr::Struct(expr_struct) => {
+                PublicIdentifier::visit_path(&expr_struct.path, current_module_path, references);
+                for field in &expr_struct.fields {
+                    PublicIdentifier::visit_expr(&field.expr, current_module_path, references);
+                }
+                if let Some(rest) = &expr_struct.rest {
+                    PublicIdentifier::visit_expr(rest, current_module_path, references);
+                }
+            }
+            syn::Expr::Range(expr_range) => {
+                if let Some(start) = &expr_range.start {
+                    PublicIdentifier::visit_expr(start, current_module_path, references);
+                }
+                if let Some(end) = &expr_range.end {
+                    PublicIdentifier::visit_expr(end, current_module_path, references);
+                }
+            }
+            syn::Expr::Reference(expr_ref) => {
+                PublicIdentifier::visit_expr(&expr_ref.expr, current_module_path, references);
+            }
+            syn::Expr::Unsafe(expr_unsafe) => {
+                PublicIdentifier::visit_block(&expr_unsafe.block, current_module_path, references);
+            }
+            syn::Expr::Const(expr_const) => {
+                PublicIdentifier::visit_block(&expr_const.block, current_module_path, references);
+            }
+            // Literal expressions don't contain path references
+            syn::Expr::Lit(_) => {}
+            syn::Expr::Macro(_) => {
+                // Macro analysis is complex, skip for now
+            }
+            syn::Expr::Verbatim(_) => {}
+            _ => {
+                // Handle any new expression types that might be added
+            }
+        }
+    }
+
+    /// Visit a pattern to find type annotations
+    fn visit_pat(
+        pat: &syn::Pat,
+        current_module_path: &str,
+        references: &mut Vec<(String, String)>,
+    ) {
+        match pat {
+            syn::Pat::Type(pat_type) => {
+                PublicIdentifier::visit_type(&pat_type.ty, current_module_path, references);
+                PublicIdentifier::visit_pat(&pat_type.pat, current_module_path, references);
+            }
+            syn::Pat::Tuple(pat_tuple) => {
+                for elem in &pat_tuple.elems {
+                    PublicIdentifier::visit_pat(elem, current_module_path, references);
+                }
+            }
+            syn::Pat::Struct(pat_struct) => {
+                PublicIdentifier::visit_path(&pat_struct.path, current_module_path, references);
+                for field in &pat_struct.fields {
+                    PublicIdentifier::visit_pat(&field.pat, current_module_path, references);
+                }
+            }
+            syn::Pat::TupleStruct(pat_tuple_struct) => {
+                PublicIdentifier::visit_path(
+                    &pat_tuple_struct.path,
+                    current_module_path,
+                    references,
+                );
+                for elem in &pat_tuple_struct.elems {
+                    PublicIdentifier::visit_pat(elem, current_module_path, references);
+                }
+            }
+            syn::Pat::Reference(pat_ref) => {
+                PublicIdentifier::visit_pat(&pat_ref.pat, current_module_path, references);
+            }
+            syn::Pat::Slice(pat_slice) => {
+                for elem in &pat_slice.elems {
+                    PublicIdentifier::visit_pat(elem, current_module_path, references);
+                }
+            }
+            syn::Pat::Or(pat_or) => {
+                for case in &pat_or.cases {
+                    PublicIdentifier::visit_pat(case, current_module_path, references);
+                }
+            }
+            _ => {
+                // Other patterns (Ident, Lit, Wild, etc.) don't contain types
+            }
+        }
     }
 }
 
