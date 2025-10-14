@@ -173,10 +173,8 @@ pub struct PublicIdentifier {
 pub struct ModuleDependency {
     /// The module path that this module depends on (e.g., "crate::foo::bar")
     pub target_module: String,
-    /// The symbols imported from that module via `use` statements
-    pub imported_symbols: Vec<String>,
-    /// The symbols referenced directly from that module (e.g., crate::foo::Symbol::new())
-    pub referenced_symbols: Vec<String>,
+    /// The symbols used from that module (via `use` statements or direct references)
+    pub symbols: Vec<String>,
 }
 
 impl PublicIdentifier {
@@ -298,13 +296,18 @@ impl PublicIdentifier {
 
         dependencies
             .into_iter()
-            .map(
-                |(target_module, (imported_symbols, referenced_symbols))| ModuleDependency {
+            .map(|(target_module, (imported_symbols, referenced_symbols))| {
+                let mut symbols = imported_symbols;
+                symbols.extend(referenced_symbols);
+                // Remove duplicates and sort for consistency
+                symbols.sort();
+                symbols.dedup();
+
+                ModuleDependency {
                     target_module,
-                    imported_symbols,
-                    referenced_symbols,
-                },
-            )
+                    symbols,
+                }
+            })
             .collect()
     }
 
